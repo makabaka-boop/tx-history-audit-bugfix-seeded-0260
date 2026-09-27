@@ -63,6 +63,9 @@ func ParseLog(data []byte) (*Log, error) {
 		if t == "" {
 			return nil, fmt.Errorf("transactions: empty id")
 		}
+		if declared[t] {
+			return nil, fmt.Errorf("transactions: duplicate id %q", t)
+		}
 		declared[t] = true
 	}
 	if len(l.Ops) == 0 {
@@ -77,13 +80,21 @@ func ParseLog(data []byte) (*Log, error) {
 		op.Seq = i + 1
 		switch op.Type {
 		case OpRead, OpWrite:
-			// Key defaults to the empty string when omitted.
+			if op.Key == "" {
+				return nil, fmt.Errorf("op %d: %s requires a key", op.Seq, op.Type)
+			}
 		case OpCommit, OpAbort:
 			if op.Key != "" {
 				return nil, fmt.Errorf("op %d: %s must not carry a key", op.Seq, op.Type)
 			}
 		default:
 			return nil, fmt.Errorf("op %d: unknown op %q (want READ, WRITE, COMMIT or ABORT)", op.Seq, op.Type)
+		}
+		if !declared[op.Txn] {
+			return nil, fmt.Errorf("op %d: undeclared transaction %q", op.Seq, op.Txn)
+		}
+		if seq, ok := terminated[op.Txn]; ok {
+			return nil, fmt.Errorf("op %d: transaction %q already terminated at op %d", op.Seq, op.Txn, seq)
 		}
 		if op.Type == OpCommit || op.Type == OpAbort {
 			terminated[op.Txn] = op.Seq
@@ -252,8 +263,8 @@ func Audit(l *Log) *Report {
 					if _, ok := committed[wt]; !ok {
 						recV = &Violation{Seq: op.Seq, Txn: op.Txn, Op: op.Type,
 							Reason: fmt.Sprintf("commits before its source transaction %s (read at op %d) has committed", wt, readsFrom[op.Txn][wt][0])}
+						break
 					}
-					break
 				}
 			}
 			committed[op.Txn] = op.Seq
@@ -272,7 +283,7 @@ func Audit(l *Log) *Report {
 	// Final committed state: writes of committed transactions, in log order.
 	// Shown for contrast only — it can look perfectly correct while the
 	// properties above are violated.
-	for i := len(l.Ops) - 1; i >= 0; i-- {
+	for i := range l.Ops {
 		op := &l.Ops[i]
 		if op.Type == OpWrite {
 			if _, ok := committed[op.Txn]; ok {
@@ -294,7 +305,7 @@ func conflictEdges(l *Log) []Edge {
 		if a.Type != OpRead && a.Type != OpWrite {
 			continue
 		}
-		for j := i + 1; j < len(l.Ops) && j <= i+2; j++ {
+		for j := i + 1; j < len(l.Ops); j++ {
 			b := &l.Ops[j]
 			if b.Type != OpRead && b.Type != OpWrite {
 				continue
@@ -367,7 +378,6 @@ func classify(txns []string, edges []Edge) SerialResult {
 			indeg[m]--
 		}
 	}
-	sort.Strings(order)
 	return SerialResult{Acyclic: true, Order: order}
 }
 
