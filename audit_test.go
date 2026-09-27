@@ -168,6 +168,9 @@ func TestStrictSchedule(t *testing.T) {
 		t.Fatalf("all properties should hold: %+v %+v %+v",
 			rep.Recoverable.Violation, rep.Cascadeless.Violation, rep.Strict.Violation)
 	}
+	if !rep.OK {
+		t.Fatalf("OK should be true for a fully strict schedule")
+	}
 	if !rep.Serializability.Acyclic || strings.Join(rep.Serializability.Order, ",") != "T1,T2" {
 		t.Fatalf("serializability = %+v", rep.Serializability)
 	}
@@ -191,6 +194,9 @@ func TestConflictCycle(t *testing.T) {
 	}`)
 	if rep.Serializability.Acyclic {
 		t.Fatalf("expected a cycle, got order %v", rep.Serializability.Order)
+	}
+	if rep.OK {
+		t.Fatalf("OK should be false when the conflict graph has a cycle")
 	}
 	want := []string{"T1", "T2", "T1"}
 	if strings.Join(rep.Serializability.Cycle, ",") != strings.Join(want, ",") {
@@ -300,6 +306,76 @@ func TestSerialOrderLexicographicallySmallest(t *testing.T) {
 	}
 }
 
+// Conflicts remain edges even when other data operations fall between them.
+// The T1 -> T3 WR dependency must not be lost because T2 also touched the key.
+func TestNonAdjacentConflicts(t *testing.T) {
+	rep := auditJSON(t, `{
+	  "transactions": ["T1", "T2", "T3"],
+	  "ops": [
+	    {"txn": "T1", "op": "WRITE", "key": "x", "value": 1},
+	    {"txn": "T2", "op": "READ",  "key": "x"},
+	    {"txn": "T3", "op": "READ",  "key": "x"},
+	    {"txn": "T1", "op": "COMMIT"},
+	    {"txn": "T2", "op": "COMMIT"},
+	    {"txn": "T3", "op": "COMMIT"}
+	  ]
+	}`)
+
+	wantEdges := map[[2]string]bool{{"T1", "T2"}: true, {"T1", "T3"}: true}
+	gotEdges := map[[2]string]bool{}
+	for _, e := range rep.Edges {
+		gotEdges[[2]string{e.From, e.To}] = true
+	}
+	if len(gotEdges) != len(wantEdges) {
+		t.Fatalf("edges = %+v, want both T1->T2 and non-adjacent T1->T3", rep.Edges)
+	}
+	for p := range wantEdges {
+		if !gotEdges[p] {
+			t.Fatalf("edges = %+v, missing %s->%s", rep.Edges, p[0], p[1])
+		}
+	}
+	if got := strings.Join(rep.Serializability.Order, ","); got != "T1,T2,T3" {
+		t.Fatalf("order = %v, want T1,T2,T3", got)
+	}
+}
+
+// A reader with two write sources is recoverable only when every source has
+// committed. One committed source cannot mask another active source.
+func TestRecoverableRequiresAllSourcesCommitted(t *testing.T) {
+	rep := auditJSON(t, `{
+	  "transactions": ["T1", "T2", "T3"],
+	  "ops": [
+	    {"txn": "T1", "op": "WRITE", "key": "x", "value": 1},
+	    {"txn": "T3", "op": "READ",  "key": "x"},
+	    {"txn": "T1", "op": "COMMIT"},
+	    {"txn": "T2", "op": "WRITE", "key": "y", "value": 2},
+	    {"txn": "T3", "op": "READ",  "key": "y"},
+	    {"txn": "T3", "op": "COMMIT"},
+	    {"txn": "T2", "op": "COMMIT"}
+	  ]
+	}`)
+	if got := violSeq(rep.Recoverable); got != 6 {
+		t.Fatalf("recoverable violation seq = %d, want 6", got)
+	}
+}
+
+// Committed writes must be applied forward; the last committed write in the
+// log determines the final value, not the earliest one found by a reverse scan.
+func TestFinalStateUsesLastCommittedWrite(t *testing.T) {
+	rep := auditJSON(t, `{
+	  "transactions": ["T1", "T2"],
+	  "ops": [
+	    {"txn": "T1", "op": "WRITE", "key": "x", "value": 1},
+	    {"txn": "T1", "op": "COMMIT"},
+	    {"txn": "T2", "op": "WRITE", "key": "x", "value": 2},
+	    {"txn": "T2", "op": "COMMIT"}
+	  ]
+	}`)
+	if rep.FinalState["x"] != 2 {
+		t.Fatalf("finalState[x] = %v, want 2", rep.FinalState["x"])
+	}
+}
+
 func TestParseValidation(t *testing.T) {
 	cases := []struct {
 		name, in, wantErr string
@@ -311,7 +387,11 @@ func TestParseValidation(t *testing.T) {
 		{"empty id", `{"transactions":["","T2"],"ops":[]}`, "empty id"},
 		{"empty ops", `{"transactions":["T1","T2"],"ops":[]}`, "log is empty"},
 		{"undeclared txn", `{"transactions":["T1","T2"],"ops":[{"txn":"T9","op":"COMMIT"}]}`, "undeclared transaction"},
+		{"missing txn", `{"transactions":["T1","T2"],"ops":[{"op":"COMMIT"}]}`, "missing transaction id"},
+		{"missing op type", `{"transactions":["T1","T2"],"ops":[{"txn":"T1"}]}`, "missing op type"},
 		{"read without key", `{"transactions":["T1","T2"],"ops":[{"txn":"T1","op":"READ"}]}`, "requires a key"},
+		{"write without key", `{"transactions":["T1","T2"],"ops":[{"txn":"T1","op":"WRITE"}]}`, "requires a key"},
+		{"trailing JSON", `{"transactions":["T1","T2"],"ops":[{"txn":"T1","op":"COMMIT"},{"txn":"T2","op":"COMMIT"}]} {}`, "trailing data"},
 		{"commit with key", `{"transactions":["T1","T2"],"ops":[{"txn":"T1","op":"COMMIT","key":"x"}]}`, "must not carry a key"},
 		{"unknown op", `{"transactions":["T1","T2"],"ops":[{"txn":"T1","op":"DELETE","key":"x"}]}`, "unknown op"},
 		{"op after commit", `{"transactions":["T1","T2"],"ops":[
@@ -333,6 +413,22 @@ func TestParseValidation(t *testing.T) {
 				t.Fatalf("err = %v, want substring %q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestParseReassignsSeq(t *testing.T) {
+	l, err := ParseLog([]byte(`{
+	  "transactions": ["T1", "T2"],
+	  "ops": [
+	    {"seq": 99, "txn": "T1", "op": "COMMIT"},
+	    {"seq": 1,  "txn": "T2", "op": "COMMIT"}
+	  ]
+	}`))
+	if err != nil {
+		t.Fatalf("ParseLog: %v", err)
+	}
+	if l.Ops[0].Seq != 1 || l.Ops[1].Seq != 2 {
+		t.Fatalf("seqs = %d,%d, want 1,2", l.Ops[0].Seq, l.Ops[1].Seq)
 	}
 }
 

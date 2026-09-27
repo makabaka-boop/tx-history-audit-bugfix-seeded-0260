@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"sort"
 )
 
@@ -49,52 +50,95 @@ const (
 //   - every transaction has exactly one terminating COMMIT or ABORT and no
 //     operation of that transaction may appear after it.
 func ParseLog(data []byte) (*Log, error) {
-	var l Log
+	type rawLog struct {
+		Transactions []string `json:"transactions"`
+		Ops          []struct {
+			Txn   *string `json:"txn"`
+			Type  *OpType `json:"op"`
+			Key   *string `json:"key"`
+			Value int64   `json:"value"`
+			Seq   int     `json:"seq"`
+		} `json:"ops"`
+	}
+
+	var raw rawLog
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(&l); err != nil {
+	if err := dec.Decode(&raw); err != nil {
 		return nil, fmt.Errorf("invalid JSON: %w", err)
 	}
-	if len(l.Txns) < minTxns || len(l.Txns) > maxTxns {
-		return nil, fmt.Errorf("transactions: need %d..%d distinct ids, got %d", minTxns, maxTxns, len(l.Txns))
+	var extra struct{}
+	if err := dec.Decode(&extra); err != io.EOF {
+		return nil, fmt.Errorf("invalid JSON: trailing data after log object")
 	}
-	declared := make(map[string]bool, len(l.Txns))
-	for _, t := range l.Txns {
+	if raw.Transactions == nil {
+		return nil, fmt.Errorf("transactions: missing or not a JSON array")
+	}
+	if raw.Ops == nil {
+		return nil, fmt.Errorf("ops: missing or not a JSON array")
+	}
+	if len(raw.Transactions) < minTxns || len(raw.Transactions) > maxTxns {
+		return nil, fmt.Errorf("transactions: need %d..%d distinct ids, got %d", minTxns, maxTxns, len(raw.Transactions))
+	}
+
+	declared := make(map[string]bool, len(raw.Transactions))
+	for _, t := range raw.Transactions {
 		if t == "" {
 			return nil, fmt.Errorf("transactions: empty id")
 		}
+		if declared[t] {
+			return nil, fmt.Errorf("transactions: duplicate id %q", t)
+		}
 		declared[t] = true
 	}
-	if len(l.Ops) == 0 {
+	if len(raw.Ops) == 0 {
 		return nil, fmt.Errorf("ops: log is empty")
 	}
-	if len(l.Ops) > maxOps {
-		return nil, fmt.Errorf("ops: at most %d operations allowed, got %d", maxOps, len(l.Ops))
+	if len(raw.Ops) > maxOps {
+		return nil, fmt.Errorf("ops: at most %d operations allowed, got %d", maxOps, len(raw.Ops))
 	}
-	terminated := make(map[string]int, len(l.Txns)) // txn -> seq of its terminator
-	for i := range l.Ops {
-		op := &l.Ops[i]
-		op.Seq = i + 1
+
+	l := &Log{Txns: raw.Transactions, Ops: make([]Op, len(raw.Ops))}
+	terminated := make(map[string]OpType, len(raw.Transactions)) // txn -> its terminator type
+	for i := range raw.Ops {
+		r := &raw.Ops[i]
+		seq := i + 1
+		if r.Txn == nil || *r.Txn == "" {
+			return nil, fmt.Errorf("op %d: missing transaction id", seq)
+		}
+		if r.Type == nil {
+			return nil, fmt.Errorf("op %d: missing op type (want READ, WRITE, COMMIT or ABORT)", seq)
+		}
+		if !declared[*r.Txn] {
+			return nil, fmt.Errorf("op %d: undeclared transaction %q", seq, *r.Txn)
+		}
+		if term, ok := terminated[*r.Txn]; ok {
+			return nil, fmt.Errorf("op %d: transaction %q already terminated with %s", seq, *r.Txn, term)
+		}
+
+		op := Op{Seq: seq, Txn: *r.Txn, Type: *r.Type, Value: r.Value}
 		switch op.Type {
 		case OpRead, OpWrite:
-			// Key defaults to the empty string when omitted.
-		case OpCommit, OpAbort:
-			if op.Key != "" {
-				return nil, fmt.Errorf("op %d: %s must not carry a key", op.Seq, op.Type)
+			if r.Key == nil || *r.Key == "" {
+				return nil, fmt.Errorf("op %d: %s requires a key", seq, op.Type)
 			}
+			op.Key = *r.Key
+		case OpCommit, OpAbort:
+			if r.Key != nil {
+				return nil, fmt.Errorf("op %d: %s must not carry a key", seq, op.Type)
+			}
+			terminated[op.Txn] = op.Type
 		default:
-			return nil, fmt.Errorf("op %d: unknown op %q (want READ, WRITE, COMMIT or ABORT)", op.Seq, op.Type)
+			return nil, fmt.Errorf("op %d: unknown op %q (want READ, WRITE, COMMIT or ABORT)", seq, op.Type)
 		}
-		if op.Type == OpCommit || op.Type == OpAbort {
-			terminated[op.Txn] = op.Seq
-		}
+		l.Ops[i] = op
 	}
 	for _, t := range l.Txns {
 		if _, ok := terminated[t]; !ok {
 			return nil, fmt.Errorf("transaction %q never terminates: exactly one COMMIT or ABORT is required", t)
 		}
 	}
-	return &l, nil
+	return l, nil
 }
 
 // ---------- report model ----------
@@ -159,7 +203,8 @@ type SerialResult struct {
 	Cycle   []string `json:"cycle,omitempty"`
 }
 
-// Report is the full audit output.
+// Report is the full audit output. OK is true only when the schedule is
+// conflict-serializable and satisfies all three execution properties.
 type Report struct {
 	OK              bool             `json:"ok"`
 	Transactions    []string         `json:"transactions"`
@@ -249,11 +294,10 @@ func Audit(l *Log) *Report {
 				}
 				sort.Strings(writers)
 				for _, wt := range writers {
-					if _, ok := committed[wt]; !ok {
+					if _, ok := committed[wt]; !ok && recV == nil {
 						recV = &Violation{Seq: op.Seq, Txn: op.Txn, Op: op.Type,
 							Reason: fmt.Sprintf("commits before its source transaction %s (read at op %d) has committed", wt, readsFrom[op.Txn][wt][0])}
 					}
-					break
 				}
 			}
 			committed[op.Txn] = op.Seq
@@ -268,11 +312,12 @@ func Audit(l *Log) *Report {
 	rep.Recoverable = PropResult{OK: recV == nil, Violation: recV}
 	rep.Cascadeless = PropResult{OK: casV == nil, Violation: casV}
 	rep.Strict = PropResult{OK: strV == nil, Violation: strV}
+	rep.OK = rep.Serializability.Acyclic && rep.Recoverable.OK && rep.Cascadeless.OK && rep.Strict.OK
 
-	// Final committed state: writes of committed transactions, in log order.
-	// Shown for contrast only — it can look perfectly correct while the
-	// properties above are violated.
-	for i := len(l.Ops) - 1; i >= 0; i-- {
+	// Final committed state: writes of committed transactions, applied in
+	// log order. Shown for contrast only — it can look perfectly correct
+	// while the properties above are violated.
+	for i := range l.Ops {
 		op := &l.Ops[i]
 		if op.Type == OpWrite {
 			if _, ok := committed[op.Txn]; ok {
@@ -294,7 +339,7 @@ func conflictEdges(l *Log) []Edge {
 		if a.Type != OpRead && a.Type != OpWrite {
 			continue
 		}
-		for j := i + 1; j < len(l.Ops) && j <= i+2; j++ {
+		for j := i + 1; j < len(l.Ops); j++ {
 			b := &l.Ops[j]
 			if b.Type != OpRead && b.Type != OpWrite {
 				continue
@@ -367,7 +412,6 @@ func classify(txns []string, edges []Edge) SerialResult {
 			indeg[m]--
 		}
 	}
-	sort.Strings(order)
 	return SerialResult{Acyclic: true, Order: order}
 }
 

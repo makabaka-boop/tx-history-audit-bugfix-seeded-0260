@@ -44,6 +44,7 @@
 
 成功时向 stdout 输出 JSON 报告（退出码 0）：
 
+- 顶层 `ok` 为 `true`；只要冲突图有环，或任一性质不满足，`ok` 为 `false`；
 - `reads`：每个 READ 的来源（写入序号/事务/值，或初始版本）；
 - `edges`：冲突图的边及全部冲突操作对（键、类型 RW/WR/WW、双方序号）；
 - `serializability`：`acyclic` + `order`（无环）或 `cycle`（有环）；
